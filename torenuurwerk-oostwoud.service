@@ -1,0 +1,28 @@
+[Unit]
+Description=Torenuurwerk Oostwoud
+After=syslog.target network.target
+
+[Service]
+Environment=PYTHONUNBUFFERED=1
+Type=simple
+#ExecStartPre=
+ExecStart=/usr/bin/python /home/pi/torenuurwerk-oostwoud/torenuurwerk-oostwoud.py
+Restart=always
+RestartSec=10
+#ExecStopPost=
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=torenuurwerk
+
+[Install]
+WantedBy=multi-user.target
+
+# om mij te installeren:
+# kopieer dit bestand naar /etc/systemd/system
+# `sudo cp /home/pi/torenuurwerk-oostwoud/torenuurwerk-oostwoud.service /etc/systemd/system`
+# zet de service aan:
+# `sudo systemctl enable torenuurwerk-oostwoud.service`
+# `sudo systemctl start torenuurwerk-oostwoud.service`
+# om de status te checken:
+# `sudo systemctl status torenuurwerk-oostwoud.service`
+
