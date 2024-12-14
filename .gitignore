@@ -163,3 +163,5 @@ cython_debug/
 # Added by cargo
 
 /target
+config.json
+Cargo.lock
