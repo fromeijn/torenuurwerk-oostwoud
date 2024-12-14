@@ -1,15 +1,37 @@
 use log::*;
-use rppal::gpio::{Gpio, InputPin, Level, OutputPin};
+use rppal::gpio::{Gpio, InputPin, Level};
+use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(serde::Deserialize, Debug)]
+struct Config {
+    mqtt_host: String,
+    mqtt_port: u16,
+    mqtt_user: String,
+    mqtt_password: String,
+}
+
+fn read_config<P: AsRef<Path>>(path: P) -> Config {
+    let config_content = std::fs::read_to_string(path).expect("Unable to read config.json");
+    let config: Config =
+        serde_json::from_str(&config_content).expect("Unable to parse config.json");
+    config
+}
+
+fn main() {
     env_logger::init();
     info!("Church clock controller started!");
 
-    let gpio = Gpio::new()?;
-    let chime_lever_pin: InputPin = gpio.get(16)?.into_input_pullup();
+    let config = read_config("./config.json");
+    info!("Config: {:?}", config);
+
+    let gpio = Gpio::new().expect("Unable to get raspberry pi GPIOs");
+    let chime_lever_pin: InputPin = gpio
+        .get(16)
+        .expect("Unable to get chime lever input")
+        .into_input_pullup();
     let (time_of_clock_tx, time_of_clock_rx) = mpsc::channel();
 
     monitor_time_of_clock(chime_lever_pin, time_of_clock_tx);
