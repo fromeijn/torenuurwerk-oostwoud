@@ -3,11 +3,52 @@ import time
 import logging
 from logging.handlers import RotatingFileHandler
 from os import system, getuid
+import datetime
+import paho.mqtt.client as mqtt
+import json
+import numpy as np
+import pandas as pd
 
+with open("/home/pi/torenuurwerk-oostwoud/config.json") as f:
+    config = json.load(f)
 
+start_timestamp = datetime.datetime.now().timestamp()
+slag_timestamp = pd.Timestamp.now()
+slag_aantal = 0
+slingervanger_state = "inactive"
+last_hart_sensor = False
+
+mqtt_topic = "torenuurwerk-oostwoud"
+
+def on_connect(client, userdata, flags, rc):
+    logger.info("Connected with result code "+str(rc))
+    client.subscribe(mqtt_topic+"/#")
+
+def on_message(client, userdata, msg):
+    global slingervanger_state
+    if msg.topic == mqtt_topic+"/slingervanger/set":
+        logger.info("slingervanger set state: "+str(msg.payload))
+        if msg.payload == b"active":
+            slingervanger_state = "active"
+        elif msg.payload == b"inactive":
+            slingervanger_state = "inactive"
+        else:
+            return
+        client.publish(mqtt_topic+"/slingervanger/state", slingervanger(slingervanger_state))
+
+def on_publish(client, userdata, mid):
+    pass
+
+def on_subscribe(client, userdata, mid, granted_qos):
+    logger.info("Subscribed: "+str(mid)+" "+str(granted_qos))
+          
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
 
+AANTAL_SECONDEN_IN_EEN_DAG = 24*60*60
+AANTAL_SECONDEN_IN_EEN_HALFUUR = 0.5*60*60
+SLAG_TELLEN_TIMEOUT_SECONDEN = 120
+STUUR_UPTIME_INTERVAL_SECONDEN = 60
 MAXIMALE_OPWINDTIJD_SECONDEN = 60
 OPWIND_MOTOR_AAN = 24
 OPWIND_MOTOR_SLAG = 22
@@ -65,9 +106,9 @@ inputs_to_names = {
 INPUTS_INVERTED = {
     SLINGERVANGER_IN: True,
     SLINGERVANGER_UIT: True,
-    SLAGWERK_OPHALEN: False,
-    GAANTWERK_OPHALEN: False,
-    NOOD_EINDE: False,
+    SLAGWERK_OPHALEN: True,
+    GAANTWERK_OPHALEN: True,
+    NOOD_EINDE: True,
     HART_SENSOR: False,
     KNOPJE: True,
 }
@@ -110,42 +151,43 @@ def waarde_ingang(ingang):
     return GPIO.input(ingang) ^ INPUTS_INVERTED[ingang]
 
 def slingervanger(actief):
-    if actief:
+    if actief == "active":
         if waarde_ingang(SLINGERVANGER_UIT):
-            logger.info("Slinger vanger is al uit")
-            return
+            logger.info("Slingervanger is al uit")
+            return "active"
         logger.info("Slinger vanger wordt uitgezet")
         zet_relay(SLINGERVANGER_RICHTING, True)
         zet_relay(SLINGERVANGER_AAN, True)
     else:
         if waarde_ingang(SLINGERVANGER_IN):
-            logger.info("Slinger vanger is al ingetrokken")
-            return
+            logger.info("Slingervanger is al ingetrokken")
+            return "inactive"
         logger.info("Slinger vanger wordt ingetrokken")
         zet_relay(SLINGERVANGER_RICHTING, False)
         zet_relay(SLINGERVANGER_AAN, True)
 
     # Relay mag niet te lang aan staan, anders brandt de diode door en wordt de 
-    if actief:
+    if actief == "active":
         for i in range(10):
             if waarde_ingang(SLINGERVANGER_UIT):
-                logger.info("Slinger vanger is uit")
-                time.sleep(0.1)
+                logger.info("Slingervanger is uit")
+                time.sleep(2)
                 zet_relay(SLINGERVANGER_AAN, False)
-                return
+                return "active"
             time.sleep(0.05)
-        logger.info("Slinger vanger is niet uit")
+        logger.error("Slingervanger is niet uit")
     else:
         for i in range(10):
             if waarde_ingang(SLINGERVANGER_IN):
-                logger.info("Slinger vanger is ingetrokken")
-                time.sleep(0.1)
+                logger.info("Slingervanger is ingetrokken")
+                time.sleep(2)
                 zet_relay(SLINGERVANGER_AAN, False)
-                return
-            time.sleep(0.05)
-        logger.info("Slinger vanger is niet ingetrokken")
+                return "inactive"
+            time.sleep(0.2)
+        logger.error("Slingervanger is niet ingetrokken")
     
     zet_relay(SLINGERVANGER_AAN, False)
+    return "error"
 
 def opwinden(werk):
     if werk == 'slag':
@@ -182,21 +224,58 @@ def gpio_changed(channel):
     global opwinden_vraag_gaand
     global opwinden_vraag_slag
     global fout_gedetecteerd
+    global slag_timestamp
+    global slag_aantal
+    global last_hart_sensor
     time.sleep(0.2)
-    logger.info(f'Wijzinging gedetecteerd voor {inputs_to_names[channel]} ({channel}) naar {waarde_ingang(channel)}')
-    if(channel == NOOD_EINDE and waarde_ingang(channel)):
+    ingang_waarde = bool(waarde_ingang(channel))
+    logger.info(f'Wijzinging gedetecteerd voor {inputs_to_names[channel]} ({channel}) naar {ingang_waarde}')
+    if channel == NOOD_EINDE and ingang_waarde:
         fout_gedetecteerd = 'Nood einde'
-    if(channel == GAANTWERK_OPHALEN and waarde_ingang(channel)):
+    if channel == GAANTWERK_OPHALEN and ingang_waarde:
         opwinden_vraag_gaand = True
-    if(channel == SLAGWERK_OPHALEN and waarde_ingang(channel)):
+    if channel == SLAGWERK_OPHALEN and ingang_waarde:
         opwinden_vraag_slag = True
-    if(channel == KNOPJE and waarde_ingang(channel)):
+    if channel == KNOPJE and ingang_waarde:
         logger.warn("Knopje is ingedrukt, raspberry wordt afgesloten")
         system("shutdown now -h")
+    if channel == HART_SENSOR:
+        if ingang_waarde and ingang_waarde != last_hart_sensor:
+            if slag_timestamp + pd.Timedelta(seconds=SLAG_TELLEN_TIMEOUT_SECONDEN) < pd.Timestamp.now() and slag_aantal == 0:
+                slag_timestamp = pd.Timestamp.now()
+                slag_aantal = 1
+                logger.info(f"Slag wordt geteld {slag_aantal}")
+            else:
+                slag_aantal = slag_aantal + 1
+                logger.info(f"Slag wordt geteld {slag_aantal}")
+        last_hart_sensor = ingang_waarde
+
+    if channel == SLINGERVANGER_IN and ingang_waarde:
+        client.publish(mqtt_topic+"/slingervanger/state", "inactive")
+    if channel == SLINGERVANGER_UIT and ingang_waarde:
+        client.publish(mqtt_topic+"/slingervanger/state", "active")
+
+        
+
 
 if __name__ == "__main__":
     logger = create_rotating_log("/home/pi/torenuurwerk-oostwoud/torenuurwerk-oostwoud.log")
     logger.info("Programma wordt gestart")
+
+    client = mqtt.Client(client_id="torenuurwerk-oostwoud",
+                            transport="tcp",
+                            protocol=mqtt.MQTTv311,
+                            clean_session=True)
+
+    client.on_message = on_message
+    client.on_connect = on_connect
+    client.on_publish = on_publish
+    client.on_subscribe = on_subscribe
+
+    client.username_pw_set(config["mqtt_user"], config["mqtt_password"])
+    client.connect(config["mqtt_host"], config["mqtt_port"])
+    client.loop_start();
+
 
     for i in inputs:
         GPIO.setup(i, GPIO.IN, pull_up_down=GPIO.PUD_UP)
@@ -209,14 +288,10 @@ if __name__ == "__main__":
         fout_gedetecteerd = 'Nood einde'
         logger.info("Nood einde is ingedrukt, programma wordt gestopt")
 
-    slinger_vanger_state = False
-    slingervanger(slinger_vanger_state)
-
-    # while True:
-    #     input(f"enter next state: {not slinger_vanger_state}")
-              
-    #     slinger_vanger_state = not slinger_vanger_state
-    #     slingervanger(slinger_vanger_state)
+    client.publish(mqtt_topic+"/slingervanger/state", slingervanger(slingervanger_state))
+    client.publish(mqtt_topic+"/state", "idle")
+    client.publish(mqtt_topic+"/uptime", int(datetime.datetime.now().timestamp()-start_timestamp))
+    uptime_send_timestamp = datetime.datetime.now().timestamp()
 
     led_state = True
     """ hooft programma loop, werkt zolang er geen fout """
@@ -228,11 +303,26 @@ if __name__ == "__main__":
             opwinden_vraag_slag = False
             opwinden('slag')
         time.sleep(0.5)
+
+        if slag_aantal > 0 and slag_timestamp + pd.Timedelta(seconds=SLAG_TELLEN_TIMEOUT_SECONDEN) < pd.Timestamp.now():
+            tijd_verschil_seconden = (slag_timestamp - slag_timestamp.round('30min')).seconds
+            if tijd_verschil_seconden > AANTAL_SECONDEN_IN_EEN_HALFUUR:
+                tijd_verschil_seconden = tijd_verschil_seconden - AANTAL_SECONDEN_IN_EEN_DAG
+            logger.info(f"Slag timestamp: {slag_timestamp} ({slag_timestamp.round('30min').to_pydatetime()}) = {tijd_verschil_seconden}")
+            logger.info(f"Slag is geteld {slag_aantal} ({tijd_verschil_seconden})")
+            client.publish(mqtt_topic+"/slag", slag_aantal)
+            client.publish(mqtt_topic+"/verschil", tijd_verschil_seconden)
+            slag_aantal = 0
+
+
+        if uptime_send_timestamp + STUUR_UPTIME_INTERVAL_SECONDEN < datetime.datetime.now().timestamp():
+            uptime_send_timestamp = datetime.datetime.now().timestamp()
+            client.publish(mqtt_topic+"/uptime", int(datetime.datetime.now().timestamp()-start_timestamp))
         zet_relay(LED, led_state)
         led_state = not led_state
 
 
-
+    client.publish(mqtt_topic+"/state", "error (fout gedetecteerd: "+fout_gedetecteerd+")")
     logger.info(f"fout gedetecteerd: {fout_gedetecteerd}")
     zet_meerdere_relays(relays, [False, False, False, False, False])
 
@@ -247,4 +337,3 @@ if __name__ == "__main__":
             i = 0
             logger.info(f"fout gedetecteerd: {fout_gedetecteerd}")
         time.sleep(1)
-
