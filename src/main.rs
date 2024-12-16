@@ -73,23 +73,22 @@ fn main() {
         panic!("Unable to connect:\n\t{:?}", e);
     }
 
-    let app_status = MqttAppStatus {
-        uptime_seconds: app_start_time.elapsed().as_secs(),
-    };
-
-    mqtt.publish(paho_mqtt::Message::new(
-        "rust/AppStatus",
-        serde_json::to_string(&app_status).expect("Unable to serialize app status"),
-        0,
-    ))
-    .expect("Unable to publish app status to mqtt broker");
-
     let gpio = Gpio::new().expect("Unable to get raspberry pi GPIOs");
+    let mut led = gpio
+        .get(12)
+        .expect("Unable to get LED pin")
+        .into_output_high();
+
     let chime_lever_pin = gpio
         .get(16)
         .expect("Unable to get chime lever input")
         .into_input_pullup();
     let (time_of_clock_tx, time_of_clock_rx) = mpsc::channel();
+
+    let clock_winder_motor_enable = gpio
+        .get(24)
+        .expect("Unable to get clock winder motor enable pin")
+        .into_output_high();
     let clock_winder_motor_timekeeping_direction = gpio
         .get(1)
         .expect("Unable to get clock winder motor for timekeeping direction pin")
@@ -109,6 +108,7 @@ fn main() {
     let (clock_winder_status_tx, clock_winder_status_rx) = mpsc::channel();
 
     clock_winder(
+        clock_winder_motor_enable,
         clock_winder_motor_timekeeping_direction,
         clock_winder_motor_striking_direction,
         clock_winder_timekeeping_request,
@@ -117,6 +117,9 @@ fn main() {
     );
 
     monitor_time_of_clock(chime_lever_pin, time_of_clock_tx);
+
+    let mut last_blink = Instant::now();
+    let mut last_mqtt_alive = Instant::now();
 
     loop {
         if let Ok(clock_time) = time_of_clock_rx.try_recv() {
@@ -139,6 +142,25 @@ fn main() {
                 0,
             ))
             .expect("Unable to publish clock time to mqtt broker");
+        }
+
+        if last_mqtt_alive.elapsed() >= Duration::from_secs(10) {
+            let app_status = MqttAppStatus {
+                uptime_seconds: app_start_time.elapsed().as_secs(),
+            };
+
+            mqtt.publish(paho_mqtt::Message::new(
+                "rust/AppStatus",
+                serde_json::to_string(&app_status).expect("Unable to serialize app status"),
+                0,
+            ))
+            .expect("Unable to publish app status to mqtt broker");
+            last_mqtt_alive = Instant::now();
+        }
+
+        if last_blink.elapsed() >= Duration::from_millis(500) {
+            led.toggle();
+            last_blink = Instant::now();
         }
 
         thread::sleep(Duration::from_millis(100)); // Push data very 100 ms
@@ -193,6 +215,7 @@ fn monitor_time_of_clock(chime_lever_pin: InputPin, tx: mpsc::Sender<MqttClockTi
 }
 
 fn clock_winder(
+    mut motor_enable: OutputPin,
     mut motor_timekeeping: OutputPin,
     mut motor_striking: OutputPin,
     request_timekeeping: InputPin,
@@ -205,14 +228,17 @@ fn clock_winder(
         loop {
             if request_striking.is_high() {
                 current_status = ClockWinderStatus::WindingStriking;
+                motor_enable.set_high();
                 motor_striking.set_high();
                 motor_timekeeping.set_low();
             } else if request_timekeeping.is_high() {
                 current_status = ClockWinderStatus::WindingTimekeeping;
+                motor_enable.set_high();
                 motor_striking.set_low();
                 motor_timekeeping.set_high();
             } else {
                 current_status = ClockWinderStatus::Idle;
+                motor_enable.set_low();
                 motor_striking.set_low();
                 motor_timekeeping.set_low();
             }
