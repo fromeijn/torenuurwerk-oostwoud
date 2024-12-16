@@ -1,6 +1,6 @@
 use chrono::{Local, NaiveDateTime, Timelike};
 use core::fmt;
-use log::{info, debug}
+use log::{debug, info};
 use rppal::gpio::{Gpio, InputPin, Level, OutputPin};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -26,6 +26,36 @@ struct MqttClockTime {
     number_of_chimes: u8,
     offset_seconds: f32,
 }
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum PendulumCatcherCommand {
+    Catch,
+    Free,
+}
+
+impl fmt::Display for PendulumCatcherCommand {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum PendulumCatcherStatus {
+    Unknown,
+    Error,
+    Catching,
+    Caught,
+    Freeing,
+    Freed,
+}
+
+impl fmt::Display for PendulumCatcherStatus {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+const PENDULUM_CATCHER_COMMAND_MQTT_TOPIC: &str = "rust/PendulumCatcher/set";
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum ClockWinderStatus {
@@ -73,6 +103,10 @@ fn main() {
         panic!("Unable to connect:\n\t{:?}", e);
     }
 
+    mqtt.subscribe(PENDULUM_CATCHER_COMMAND_MQTT_TOPIC, 0)
+        .expect("Unable to subscribe to mqtt topic");
+    let mqtt_rx = mqtt.start_consuming();
+
     let gpio = Gpio::new().expect("Unable to get raspberry pi GPIOs");
     let mut led = gpio
         .get(12)
@@ -84,8 +118,36 @@ fn main() {
         .expect("Unable to get chime lever input")
         .into_input_pullup();
     let (time_of_clock_tx, time_of_clock_rx) = mpsc::channel();
-    
+
     monitor_time_of_clock(chime_lever_pin, time_of_clock_tx);
+
+    let pendulum_catcher_motor_enable = gpio
+        .get(17)
+        .expect("Unable to get pendulum motor enable pin")
+        .into_output_high();
+    let pendulum_catcher_motor_direction = gpio
+        .get(27)
+        .expect("Unable to get pendulum motor direction pin")
+        .into_output_high();
+    let pendulum_catcher_sense_in = gpio
+        .get(21)
+        .expect("Unable to get pendulum sense in pin")
+        .into_input();
+    let pendulum_catcher_sense_out = gpio
+        .get(26)
+        .expect("Unable to get pendulum sense out pin")
+        .into_input();
+    let (pendulum_catcher_command_tx, pendulum_catcher_command_rx) = mpsc::channel();
+    let (pendulum_catcher_status_tx, pendulum_catcher_status_rx) = mpsc::channel();
+
+    pendulum_catcher(
+        pendulum_catcher_motor_enable,
+        pendulum_catcher_motor_direction,
+        pendulum_catcher_sense_in,
+        pendulum_catcher_sense_out,
+        pendulum_catcher_command_rx,
+        pendulum_catcher_status_tx,
+    );
 
     let clock_winder_motor_enable = gpio
         .get(24)
@@ -118,11 +180,11 @@ fn main() {
         clock_winder_status_tx,
     );
 
-
     let mut last_blink = Instant::now();
     let mut last_mqtt_alive = Instant::now();
 
     loop {
+        // clock time
         if let Ok(clock_time) = time_of_clock_rx.try_recv() {
             info!("Time of Clock: {:?}", clock_time);
 
@@ -134,12 +196,43 @@ fn main() {
             .expect("Unable to publish clock time to mqtt broker");
         }
 
+        // winder status
         if let Ok(clock_winder_status) = clock_winder_status_rx.try_recv() {
             info!("Clock winder status: {:?}", clock_winder_status);
 
             mqtt.publish(paho_mqtt::Message::new(
                 "rust/ClockWinder",
                 clock_winder_status.to_string(),
+                0,
+            ))
+            .expect("Unable to publish clock time to mqtt broker");
+        }
+
+        // pendulum catcher
+        if let Ok(mqtt_message) = mqtt_rx.try_recv() {
+            if let Some(mqtt_message) = mqtt_message {
+                info!("received mqtt message {}", mqtt_message);
+                if mqtt_message.topic() == PENDULUM_CATCHER_COMMAND_MQTT_TOPIC {
+                    if mqtt_message.payload_str() == PendulumCatcherCommand::Catch.to_string() {
+                        pendulum_catcher_command_tx
+                            .send(PendulumCatcherCommand::Catch)
+                            .unwrap()
+                    } else if mqtt_message.payload_str() == PendulumCatcherCommand::Free.to_string()
+                    {
+                        pendulum_catcher_command_tx
+                            .send(PendulumCatcherCommand::Free)
+                            .unwrap()
+                    }
+                }
+            };
+        }
+
+        if let Ok(pendulum_catcher_status) = pendulum_catcher_status_rx.try_recv() {
+            info!("Pendulum catcher status: {:?}", pendulum_catcher_status);
+
+            mqtt.publish(paho_mqtt::Message::new(
+                "rust/PendulumCatcher",
+                pendulum_catcher_status.to_string(),
                 0,
             ))
             .expect("Unable to publish clock time to mqtt broker");
@@ -227,7 +320,11 @@ fn clock_winder(
         let mut last_status = ClockWinderStatus::Unknown;
         let mut current_status;
         loop {
-            debug!("striking {}, timekeeping {}", request_striking.is_low(), request_timekeeping.is_low());
+            debug!(
+                "striking {}, timekeeping {}",
+                request_striking.is_low(),
+                request_timekeeping.is_low()
+            );
             if request_striking.is_low() {
                 current_status = ClockWinderStatus::WindingStriking;
                 motor_enable.set_low();
@@ -241,7 +338,7 @@ fn clock_winder(
             } else {
                 current_status = ClockWinderStatus::Idle;
                 motor_enable.set_high();
-                motor_striking.set_low(); 
+                motor_striking.set_low();
                 motor_timekeeping.set_low();
             }
 
@@ -249,6 +346,99 @@ fn clock_winder(
                 last_status = current_status;
                 status.send(current_status.clone()).unwrap();
             }
+            thread::sleep(Duration::from_millis(100)); // Polling interval
+        }
+    });
+}
+
+fn pendulum_catcher(
+    mut motor_enable: OutputPin,
+    mut motor_direction: OutputPin,
+    sense_in: InputPin,
+    sense_out: InputPin,
+    commands: mpsc::Receiver<PendulumCatcherCommand>,
+    status: mpsc::Sender<PendulumCatcherStatus>,
+) {
+    thread::spawn(move || {
+        let mut last_status = PendulumCatcherStatus::Unknown;
+        let mut current_status;
+        let mut start_command = Instant::now();
+
+        motor_direction.set_high(); // inactive
+        motor_enable.set_high(); // inactive
+
+        loop {
+            debug!(
+                "sense in {}, sense out {}",
+                sense_in.is_low(),
+                sense_out.is_low()
+            );
+
+            match last_status {
+                PendulumCatcherStatus::Error => {
+                    motor_enable.set_high();
+                    motor_direction.set_high();
+                    current_status = last_status;
+                }
+                PendulumCatcherStatus::Catching => {
+                    if sense_out.is_low() {
+                        motor_enable.set_high();
+                        current_status = PendulumCatcherStatus::Caught;
+                    } else if start_command.elapsed() >= Duration::from_secs(2) {
+                        motor_enable.set_high();
+                        current_status = PendulumCatcherStatus::Error;
+                    } else {
+                        current_status = last_status;
+                    }
+                }
+                PendulumCatcherStatus::Freeing => {
+                    if sense_in.is_low() {
+                        motor_enable.set_high();
+                        current_status = PendulumCatcherStatus::Freed;
+                    } else if start_command.elapsed() >= Duration::from_secs(2) {
+                        motor_enable.set_high();
+                        current_status = PendulumCatcherStatus::Error;
+                    } else {
+                        current_status = last_status;
+                    }
+                }
+                PendulumCatcherStatus::Freed
+                | PendulumCatcherStatus::Caught
+                | PendulumCatcherStatus::Unknown => {
+                    if sense_in.is_low() && sense_out.is_high() {
+                        current_status = PendulumCatcherStatus::Freed;
+                    } else if sense_in.is_high() && sense_out.is_low() {
+                        current_status = PendulumCatcherStatus::Caught;
+                    } else {
+                        current_status = PendulumCatcherStatus::Unknown;
+                    }
+                }
+            }
+
+            if let Ok(command) = commands.try_recv() {
+                match command {
+                    PendulumCatcherCommand::Catch => {
+                        motor_direction.set_low();
+                        // motor_enable.set_low(); // not tested yet
+                        start_command = Instant::now();
+                        current_status = PendulumCatcherStatus::Catching;
+                        info!("start catching pendulum");
+                    }
+                    PendulumCatcherCommand::Free => {
+                        motor_direction.set_high();
+                        // motor_enable.set_low(); // not tested yet
+                        start_command = Instant::now();
+                        current_status = PendulumCatcherStatus::Freeing;
+                        info!("start freeing pendulum");
+                    }
+                }
+            }
+
+            if current_status != last_status {
+                last_status = current_status;
+                status.send(current_status.clone()).unwrap();
+            }
+
             thread::sleep(Duration::from_millis(100)); // Polling interval
         }
     });
