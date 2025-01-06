@@ -1,0 +1,13 @@
+[package]
+name = "torenuurwerk-oostwoud"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = "0.4.39"
+env_logger = "0.11.5"
+log = "0.4.22"
+paho-mqtt = { version = "0.12.5", default-features = false, features = ["bundled"] }
+rppal = "0.22.1"
+serde = { version = "1.0.216", features = ["derive"] }
+serde_json = "1.0.133"
