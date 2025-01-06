@@ -132,11 +132,11 @@ fn main() {
     let pendulum_catcher_sense_in = gpio
         .get(21)
         .expect("Unable to get pendulum sense in pin")
-        .into_input();
+        .into_input_pullup();
     let pendulum_catcher_sense_out = gpio
         .get(26)
         .expect("Unable to get pendulum sense out pin")
-        .into_input();
+        .into_input_pullup();
     let (pendulum_catcher_command_tx, pendulum_catcher_command_rx) = mpsc::channel();
     let (pendulum_catcher_status_tx, pendulum_catcher_status_rx) = mpsc::channel();
 
@@ -382,6 +382,7 @@ fn pendulum_catcher(
                 }
                 PendulumCatcherStatus::Catching => {
                     if sense_out.is_low() {
+                        thread::sleep(Duration::from_secs(5));
                         motor_enable.set_high();
                         current_status = PendulumCatcherStatus::Caught;
                     } else if start_command.elapsed() >= Duration::from_secs(2) {
@@ -393,6 +394,7 @@ fn pendulum_catcher(
                 }
                 PendulumCatcherStatus::Freeing => {
                     if sense_in.is_low() {
+                        thread::sleep(Duration::from_secs(1));
                         motor_enable.set_high();
                         current_status = PendulumCatcherStatus::Freed;
                     } else if start_command.elapsed() >= Duration::from_secs(2) {
@@ -419,14 +421,14 @@ fn pendulum_catcher(
                 match command {
                     PendulumCatcherCommand::Catch => {
                         motor_direction.set_low();
-                        // motor_enable.set_low(); // not tested yet
+                        motor_enable.set_low();
                         start_command = Instant::now();
                         current_status = PendulumCatcherStatus::Catching;
                         info!("start catching pendulum");
                     }
                     PendulumCatcherCommand::Free => {
                         motor_direction.set_high();
-                        // motor_enable.set_low(); // not tested yet
+                        motor_enable.set_low();
                         start_command = Instant::now();
                         current_status = PendulumCatcherStatus::Freeing;
                         info!("start freeing pendulum");
