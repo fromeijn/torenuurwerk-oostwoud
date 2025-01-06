@@ -3,10 +3,11 @@ Description=Torenuurwerk Oostwoud
 After=syslog.target network.target
 
 [Service]
-Environment=PYTHONUNBUFFERED=1
+Environment=RUST_LOG=info
 Type=simple
 #ExecStartPre=
-ExecStart=/usr/bin/python /home/pi/torenuurwerk-oostwoud/torenuurwerk-oostwoud.py
+WorkingDirectory=/home/pi/torenuurwerk-oostwoud-rs
+ExecStart=/home/pi/torenuurwerk-oostwoud-rs/target/debug/torenuurwerk-oostwoud
 Restart=always
 RestartSec=10
 #ExecStopPost=
